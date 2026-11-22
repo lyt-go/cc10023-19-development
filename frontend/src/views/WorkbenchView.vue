@@ -90,6 +90,13 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <SliceRecomputePanel
+      v-if="meta.key === 'data_slice'"
+      ref="slicePanel"
+      @start-recompute="handleStartRecompute"
+    />
+    <ComputeRecomputePanel v-else-if="meta.key === 'feature_compute'" />
   </section>
 </template>
 
@@ -103,10 +110,14 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import { startRecomputeTask } from '@/api/recompute-service'
 import type { EntryRow } from '@/data/types'
+import ComputeRecomputePanel from '@/views/ComputeRecomputePanel.vue'
+import SliceRecomputePanel from '@/views/SliceRecomputePanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const slicePanel = ref<InstanceType<typeof SliceRecomputePanel> | null>(null)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -184,6 +195,19 @@ async function reload() {
     total.value = payload.total
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
+  }
+}
+
+async function handleStartRecompute(planId: number) {
+  errorMessage.value = ''
+  try {
+    const result = await startRecomputeTask(planId)
+    if (!result.ok) throw new Error(result.message)
+    errorMessage.value = ''
+    await reload()
+    await slicePanel.value?.refreshPlans()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '复算发起失败'
   }
 }
 

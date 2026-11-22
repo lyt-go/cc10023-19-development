@@ -77,5 +77,33 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 切片复算分区清单
+
+数据切片模块在通用列表之外提供「切片复算分区清单」能力，解决切片详情只有汇总行数、
+无法按日期检索缺失分区并发起复算的问题。前端入口：
+数据切片配置页底部「切片复算分区清单」面板；特征计算任务页底部「复算任务与回填核对」面板。
+
+领域存储在 `backend/app/partition_catalog.py`（分区版本链、检索快照、复算清单、计算回执、
+回填登记），专用路由在 `backend/app/routers/recompute.py`（先于通用资源路由注册）。
+
+关键接口：
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/data_slice/{id}/recompute/partitions` | 按日期窗口分页检索可复算（缺数）分区，同条件翻页复用 `search_id` |
+| `POST /api/data_slice/{id}/recompute/snapshots` | 勾选即固化当时见到的分区版本，翻页与迟到修订不改写快照 |
+| `POST /api/data_slice/recompute/check-snapshots` | 核对已勾选日期在迟到修订/补报后是否仍可用于本轮回填 |
+| `POST /api/data_slice/{id}/recompute/revisions` | 登记迟到修订（revision）或缺失补报（backfill） |
+| `POST /api/data_slice/{id}/recompute/plans` | 提交复算清单：按日期去重、拒绝跨切片/未勾选分区、拦截失效快照 |
+| `POST /api/feature_compute/recompute/tasks` | 计算任务读取复算清单发起复算，输入分区逐日期锁定版本 |
+| `GET /api/feature_compute/recompute/tasks/{id}/receipt` | 进度回执：实际处理的业务日期、输入版本、产出版本 |
+| `GET /api/feature_compute/recompute/tasks/{id}/coverage` | 出数后回填覆盖核对：漏回填与清单外产出 |
+
+守卫规则：同一业务日期在清单里只能出现一次；未勾选的分区不能进入计算输入，
+计算引擎处理清单外日期会被拒绝；迟到修订后旧快照标记冲突，必须重新检索选择才能提交。
+
+集成测试：`backend/tests/test_recompute_chains.py`（6 个场景，含分页固化、冲突核对、
+两页勾选三片、回执与覆盖核对、输入校验、路由注册顺序）。
+
 领域：数据工程
 子方向：数据分析与数据应用

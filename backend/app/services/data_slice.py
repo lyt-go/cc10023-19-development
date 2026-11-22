@@ -1,8 +1,10 @@
 """数据切片配置领域服务：定义分析数据集的筛选逻辑、时间窗口与版本管理。"""
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
+from app.partition_catalog import STATE_MISSING, catalog, parse_biz_date
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -90,4 +92,160 @@ class DataSliceService(BaseModuleService):
             "row_count": row_count,
             "source": sl.get("数据来源"),
             "business_meaning": sl.get("业务含义"),
+        }
+
+    # ── 切片复算分区清单：按日期检索缺数分区 → 固化版本 → 提交复算 ──
+    def _require_slice(self, slice_id: int) -> dict[str, Any] | None:
+        return store.find(self.MODULE, slice_id)
+
+    @staticmethod
+    def _default_window() -> tuple[str, str]:
+        """默认检索过去一周（含今天）的缺数范围。"""
+        today = date(2026, 11, 22)
+        return (today - timedelta(days=6)).isoformat(), today.isoformat()
+
+    def search_recompute_partitions(
+        self,
+        slice_id: int,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        *,
+        page: int = 1,
+        size: int = 5,
+        missing_only: bool = True,
+    ) -> dict[str, Any]:
+        """从切片时间分区数据中查询可复算分区，分页返回并给出稳定 search_id。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        if not start_date or not end_date:
+            start_date, end_date = self._default_window()
+        try:
+            result = catalog.search_partitions(
+                slice_id, start_date, end_date,
+                page=page, size=size, missing_only=missing_only)
+        except ValueError as exc:
+            return {"ok": False, "message": f"日期格式非法：{exc}，应为 YYYY-MM-DD"}
+        missing_count = sum(1 for item in result["items"] if item["missing"])
+        result.update({
+            "ok": True,
+            "message": f"检索到 {result['total']} 个可复算分区，其中本页缺数分区 {missing_count} 个",
+            "slice_name": sl.get("切片名称"),
+        })
+        return result
+
+    def freeze_partition_versions(
+        self, slice_id: int, search_id: int, biz_dates: list[str],
+    ) -> dict[str, Any]:
+        """把本次搜索勾选的日期固化成分区版本快照，支撑翻页后仍定位当时版本。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        try:
+            snapshots, error = catalog.materialize_snapshots(search_id, biz_dates)
+        except ValueError as exc:
+            return {"ok": False, "message": f"日期格式非法：{exc}，应为 YYYY-MM-DD"}
+        if error:
+            return {"ok": False, "message": error}
+        return {
+            "ok": True,
+            "message": f"已固化 {len(snapshots)} 个分区的版本快照",
+            "search_id": search_id,
+            "snapshots": snapshots,
+        }
+
+    def check_selection_availability(self, snapshot_ids: list[int]) -> dict[str, Any]:
+        """提交前（或迟到修订发生后）核对现有选择是否还能用于本轮回填。"""
+        if not snapshot_ids:
+            return {"ok": False, "message": "缺少待核对的快照编号"}
+        checks = catalog.check_snapshots(snapshot_ids)
+        conflicts = [item for item in checks if item["conflict"]]
+        return {
+            "ok": True,
+            "available": not conflicts,
+            "message": "全部选择仍可用于本轮回填" if not conflicts
+            else f"{len(conflicts)} 个选择已失效，需重新检索选择",
+            "checks": checks,
+        }
+
+    def submit_recompute_plan(
+        self,
+        slice_id: int,
+        snapshot_ids: list[int],
+        *,
+        operator: str | None = None,
+    ) -> dict[str, Any]:
+        """提交切片复算分区清单：只接受显式快照、按日期去重，并拦截失效选择。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        plan, error, conflicts = catalog.create_plan(slice_id, snapshot_ids, operator)
+        if error:
+            payload = {"ok": False, "message": error}
+            if conflicts:
+                payload["conflicts"] = conflicts
+            return payload
+        return {
+            "ok": True,
+            "message": f"复算清单 {plan['plan_id']} 已提交，共 {len(plan['entries'])} 个分区",
+            "plan": plan,
+        }
+
+    def list_recompute_plans(self, slice_id: int) -> dict[str, Any]:
+        """查询切片下已形成的复算分区清单。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        plans = catalog.list_plans(slice_id)
+        return {"ok": True, "slice_id": slice_id, "total": len(plans), "plans": plans}
+
+    def register_late_revision(
+        self, slice_id: int, biz_date: str, *, kind: str = "revision",
+    ) -> dict[str, Any]:
+        """登记迟到数据（修订/补报），用于触发已勾选版本与当前目录的冲突核对。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        try:
+            row, error = catalog.register_revision(slice_id, biz_date, kind=kind)
+        except ValueError as exc:
+            return {"ok": False, "message": f"日期格式非法：{exc}，应为 YYYY-MM-DD"}
+        if error:
+            return {"ok": False, "message": error}
+        return {
+            "ok": True,
+            "message": f"分区 {biz_date} 已登记迟到数据，当前版本 v{row['version']}（{row['state']}）",
+            "partition": row,
+        }
+
+    def query_partition_detail(self, slice_id: int, biz_date: str) -> dict[str, Any]:
+        """查看单个日期的完整分区版本链，确认修订前后的版本与状态。"""
+        sl = self._require_slice(slice_id)
+        if sl is None:
+            return {"ok": False, "message": f"切片配置 {slice_id} 不存在"}
+        try:
+            normalized = parse_biz_date(biz_date).isoformat()
+        except ValueError as exc:
+            return {"ok": False, "message": f"日期格式非法：{exc}"}
+        latest = catalog._latest_partition(slice_id, normalized)
+        if latest is None:
+            return {
+                "ok": True,
+                "slice_id": slice_id,
+                "biz_date": normalized,
+                "state": STATE_MISSING,
+                "current_version": None,
+                "version_chain": [],
+            }
+        return {
+            "ok": True,
+            "slice_id": slice_id,
+            "biz_date": normalized,
+            "state": latest["state"],
+            "current_version": latest["version"],
+            "version_chain": [
+                {"version": p["version"], "state": p["state"],
+                 "row_count": p["row_count"], "updated_at": p["updated_at"]}
+                for p in catalog._version_chain(slice_id, normalized)
+            ],
         }
